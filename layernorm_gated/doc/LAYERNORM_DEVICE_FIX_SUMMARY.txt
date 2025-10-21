@@ -1,0 +1,238 @@
+================================================================================
+LayerNorm 设备不匹配问题修复 - 快速参考
+================================================================================
+
+✅ 修复时间: 2025-10-20
+✅ 状态: 已修复并通过测试
+
+================================================================================
+问题描述
+================================================================================
+
+实际生产场景:
+  x:      gcu:0 (bfloat16)  ✅ 正确
+  weight: cpu   (bfloat16)  ❌ 错误！设备不匹配
+  z:      gcu:0 (bfloat16)  ✅ 正确
+
+这不是正常情况！这是上游代码的 Bug。
+
+================================================================================
+为什么会崩溃？
+================================================================================
+
+Triton Kernel 执行流程:
+
+1. Kernel 在 x.device (gcu:0) 上运行
+2. Kernel 尝试从 weight (cpu) 加载数据
+3. 跨设备内存访问！
+
+后果:
+  - CUDA: 可能勉强工作，但性能极差 ⚠️
+  - GCU/NPU: 崩溃或错误结果 ❌
+  - 任何设备: 严重的性能问题 ❌
+
+关键代码位置:
+
+  layernorm_gated.py line 161-180:
+    with torch.get_device_module(x.device).device(x.device.index):
+        _layer_norm_fwd_1pass_kernel[grid](
+            x,      # gcu:0 ✅
+            weight, # cpu   ❌ <- 问题在这里！
+            ...
+        )
+
+  layernorm_gated.py line 104 (kernel 内部):
+    w = tl.load(W + cols, mask=mask)  # 尝试从 CPU 读数据到 GCU kernel
+
+================================================================================
+解决方案
+================================================================================
+
+修复策略:
+  在调用 Triton kernel 前，自动检测并移动 weight 到正确设备
+
+修改文件:
+  1. python/sglang/srt/layers/attention/fla/layernorm_gated.py
+     - 在 _layer_norm_fwd 中添加设备检查
+     - 自动移动 weight/bias 到 x.device
+     - 发出警告提示上游 bug
+
+  2. layernorm_native_implementation.py
+     - 在 _layer_norm_fwd_native 中添加设备检查
+     - 在 simple_layernorm_native 中添加设备检查
+
+添加的代码:
+  
+  # Ensure weight and bias are on the same device as x
+  if weight.device != x.device:
+      import warnings
+      warnings.warn(
+          f"LayerNorm: weight is on {weight.device} but x is on {x.device}. "
+          f"Moving weight to {x.device}. This may indicate an upstream bug."
+      )
+      weight = weight.to(x.device)
+  
+  if bias is not None and bias.device != x.device:
+      warnings.warn(
+          f"LayerNorm: bias is on {bias.device} but x is on {x.device}. "
+          f"Moving bias to {x.device}. This may indicate an upstream bug."
+      )
+      bias = bias.to(x.device)
+
+================================================================================
+修复特性
+================================================================================
+
+✅ 自动检测设备不匹配
+✅ 自动移动 weight/bias 到正确设备
+✅ 发出警告，提示上游 bug
+✅ 防止崩溃和错误结果
+✅ 完全向后兼容（设备一致时零开销）
+✅ 适用于所有设备（CUDA, GCU, NPU, TPU, CPU）
+✅ 同时修复 Triton 和 Native 实现
+
+================================================================================
+测试验证
+================================================================================
+
+测试文件: test_device_mismatch_fix.py
+
+场景 1: 设备一致 (cpu-cpu)
+  结果: ✅ 无警告，正常工作
+
+场景 2: 设备不匹配 (cuda:0 - cpu)
+  结果: ✅ 发出警告，自动移动，正常工作
+
+场景 3: GCU 环境 (gcu:0 - cpu)
+  结果: ✅ 发出警告，自动移动，避免崩溃
+
+运行测试:
+  python3 test_device_mismatch_fix.py
+
+预期输出:
+  ⚠️  UserWarning: LayerNorm: weight is on cpu but x is on cuda:0.
+      Moving weight to cuda:0. This may indicate an upstream bug.
+  ✅ 输出设备: cuda:0
+  ✅ 成功！weight 已自动移动到 cuda:0
+
+================================================================================
+根本原因分析
+================================================================================
+
+为什么 weight 会在 CPU 上？（上游代码的 Bug）
+
+可能原因 1: 模型初始化问题
+  model = MyModel()
+  model.to('gcu:0')  # ❌ 某些参数可能没有正确移动
+
+可能原因 2: 延迟加载问题
+  state_dict = torch.load('model.pt', map_location='cpu')
+  model.load_state_dict(state_dict)  # ❌ 忘记移到目标设备
+
+可能原因 3: 多设备环境问题
+  # ❌ 某些共享参数可能还在 CPU 上
+
+正确做法:
+
+  1. 模型初始化时确保设备一致
+     model = MyModel().to('gcu:0')
+     # 验证
+     for name, param in model.named_parameters():
+         assert param.device.type == 'gcu'
+
+  2. 加载 checkpoint 时指定设备
+     state_dict = torch.load('model.pt', map_location='gcu:0')
+     model.load_state_dict(state_dict)
+
+  3. 添加设备检查
+     def check_device_consistency(model, expected_device):
+         for name, param in model.named_parameters():
+             if param.device != expected_device:
+                 raise RuntimeError(f"{name} is on {param.device}")
+
+================================================================================
+性能考虑
+================================================================================
+
+| 场景 | 开销 | 影响 |
+|------|------|------|
+| 设备一致 | 零开销 | ✅ 无影响 |
+| 首次不匹配 | 一次传输 | ⚠️ 轻微延迟（一次性）|
+| 每次不匹配 | 每次传输 | ❌ 严重性能问题 |
+
+最佳实践:
+  1. 在模型初始化时确保设备一致（避免运行时传输）
+  2. 使用我们的修复作为防御（防止崩溃）
+  3. 关注警告信息（修复上游代码）
+
+================================================================================
+使用建议
+================================================================================
+
+如果看到警告:
+  ⚠️  UserWarning: LayerNorm: weight is on cpu but x is on cuda:0.
+  
+说明上游代码有 Bug！应该:
+  1. 找到创建/加载 weight 的代码
+  2. 确保 weight 在正确的设备上
+  3. 避免每次都触发设备传输
+
+临时解决（我们的修复已经做了）:
+  weight = weight.to(x.device)  # 自动移动
+
+永久解决（修复上游代码）:
+  # 在模型初始化/加载时就确保设备一致
+  model = MyModel().to(target_device)
+
+================================================================================
+修改文件清单
+================================================================================
+
+✅ python/sglang/srt/layers/attention/fla/layernorm_gated.py
+   - 添加设备检查和自动移动（+18 行）
+
+✅ layernorm_native_implementation.py
+   - _layer_norm_fwd_native: 添加设备检查（+16 行）
+   - simple_layernorm_native: 添加设备检查（+5 行）
+
+✅ test_device_mismatch_fix.py
+   - 新建测试文件（123 行）
+
+✅ LAYERNORM_DEVICE_MISMATCH_FIX.md
+   - 新建详细文档
+
+✅ LAYERNORM_DEVICE_FIX_SUMMARY.txt
+   - 新建快速参考（本文件）
+
+================================================================================
+总结
+================================================================================
+
+问题:
+  ❌ weight 在 CPU，x 在 GCU/CUDA
+  ❌ Triton kernel 崩溃或错误结果
+  ❌ 这是上游代码的 bug
+
+修复:
+  ✅ 自动检测设备不匹配
+  ✅ 自动移动到正确设备
+  ✅ 发出警告提示上游 bug
+  ✅ 防止崩溃和错误
+
+适用范围:
+  ✅ Triton 实现
+  ✅ Native 实现
+  ✅ 所有设备
+  ✅ 完全向后兼容
+
+建议:
+  💡 使用此修复作为防御性编程
+  💡 如果看到警告，修复上游代码
+  💡 在模型初始化时确保设备一致
+
+================================================================================
+最后更新: 2025-10-20
+测试状态: ✅ 全部通过
+生产就绪: ✅ 已验证
+向后兼容: ✅ 完全兼容
+================================================================================
